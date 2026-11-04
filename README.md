@@ -68,6 +68,23 @@ another node in the map can still serve the same account. The extension then swi
 the next candidate (remote-agent, then inference, then security), retries, and persists
 whichever node served the request. Discovery failures fall back to the table above.
 
+### Model queue (`10605 RESOURCE_LIMIT`)
+
+When Qoder's scheduler is at capacity for an account's lane it rejects a chat request
+with `code 10605` and a queue snapshot (`isQueued`, `serviceAvailable`, `queueType`,
+`retryAfterSeconds`, `waitTime`). The extension handles it the way Qoder's own client does:
+
+- `isQueued:false` + `serviceAvailable:true`: re-send after `retryAfterSeconds` (bounded).
+- `isQueued:true`, or `serviceAvailable:false`: poll `algo/api/v2/service/ask/queue/status`
+  with the same `request_set_id` every `retryAfterSeconds` (0.5–30s), re-send once it reports
+  `isQueued:false`, and release the slot with `algo/api/v2/service/ask/finish` when the request
+  ends. The turn shows no output while it waits; Esc aborts the wait.
+
+The wait is capped by `QODER_MODEL_QUEUE_MAX_WAIT_MS` (default one hour, the same variable
+Qoder's client reads). If the queue cannot be waited on (status endpoint missing, three
+failed polls, cap reached), the request fails with a retryable `request queued … rate limit,
+retry-after-ms=…` error instead of a bare `403`. Set `QODER_DEBUG=1` to log queue polls.
+
 ## Request and account Credits
 
 The footer shows **actual session deductions in Credits**, accumulated from Qoder's

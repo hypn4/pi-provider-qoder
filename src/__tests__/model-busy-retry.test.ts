@@ -8,7 +8,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError, retryAssistantCall } from "@earendil-works/pi-ai/utils/retry";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseModelBusyRejection, streamQoder } from "../protocol/stream.js";
+import { parseModelBusyRejection, parseModelQueueStatus, streamQoder } from "../protocol/stream.js";
 
 vi.mock("../auth/oauth.js", () => ({
   resolveQoderIdentity: vi.fn().mockResolvedValue({
@@ -114,6 +114,59 @@ function mockFetchSequence(steps: FetchStep[]): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
+/** The flat JSON `ask/queue/status` returns (captured live). */
+function queueStatus(fields: { isQueued?: boolean; serviceAvailable?: boolean; retryAfterSeconds?: number }): string {
+  return JSON.stringify({
+    subCode: "RESOURCE_LIMIT",
+    modelKey: "ultimate",
+    queueType: "p3",
+    queueCount: 0,
+    waitTime: 30,
+    ...fields,
+  });
+}
+
+type RouteKind = "chat" | "status" | "finish";
+
+function routeOf(url: string): RouteKind {
+  if (url.includes("/ask/queue/status")) return "status";
+  if (url.includes("/ask/finish")) return "finish";
+  return "chat";
+}
+
+/** Route chat, queue-status and queue-finish requests to separate scripts. */
+function mockQueueRoutes(routes: { chat: FetchStep[]; status: FetchStep[]; onStatus?: () => void }): typeof fetch {
+  const queues: Record<RouteKind, FetchStep[]> = {
+    chat: [...routes.chat],
+    status: [...routes.status],
+    finish: [""],
+  };
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const kind = routeOf(String(input));
+    if (kind === "status") routes.onStatus?.();
+    const queue = queues[kind];
+    const step = queue.length > 1 ? queue.shift() : queue[0];
+    if (step === undefined) throw new Error(`mock ${kind} queue is empty`);
+    const { body, status } = typeof step === "string" ? { body: step, status: 200 } : step;
+    return new Response(body, { status });
+  }) as unknown as typeof fetch;
+}
+
+function callsOf(kind: RouteKind): Array<[string, RequestInit | undefined]> {
+  return vi
+    .mocked(globalThis.fetch)
+    .mock.calls.filter(([input]) => routeOf(String(input)) === kind)
+    .map(([input, init]) => [String(input), init]);
+}
+
+const LIVE_QUEUED_SSE = busySse({
+  isQueued: true,
+  serviceAvailable: false,
+  waitTime: 30,
+  retryAfterSeconds: 30,
+  queueType: "p3",
+});
+
 /** A chunk with no id/model so tests can prove those fields were not carried over. */
 function bareChunk(delta: object): object {
   return { choices: [{ delta, index: 0 }], created: 1, object: "chat.completion.chunk" };
@@ -180,32 +233,57 @@ describe("parseModelBusyRejection", () => {
       parseModelBusyRejection(
         busyBody({ isQueued: true, waitTime: 367, retryAfterSeconds: 30, queueCount: 454, queueType: "p2" }),
       ),
-    ).toEqual({ kind: "queued", waitMs: 367000, queueCount: 454, queueType: "p2" });
+    ).toEqual({
+      kind: "queued",
+      waitMs: 367000,
+      retryAfterMs: 30000,
+      queueCount: 454,
+      queueType: "p2",
+      modelKey: "ultimate",
+    });
+  });
+
+  it("treats serviceAvailable:false as queued, whatever isQueued says", () => {
+    // The live shape for a capacity-limited lane (observed on Qwen3.8-Flash
+    // and DeepSeek-Flash with a trial account).
+    const queued = {
+      kind: "queued",
+      waitMs: 30000,
+      retryAfterMs: 30000,
+      queueCount: 0,
+      queueType: "p3",
+      modelKey: "ultimate",
+    };
+    for (const isQueued of [true, false]) {
+      expect(
+        parseModelBusyRejection(
+          busyBody({ isQueued, serviceAvailable: false, waitTime: 30, retryAfterSeconds: 30, queueType: "p3" }),
+        ),
+      ).toEqual(queued);
+    }
   });
 
   it("falls back to retryAfterSeconds when a queued snapshot has no usable waitTime", () => {
-    expect(parseModelBusyRejection(busyBody({ isQueued: true, retryAfterSeconds: 30 }))).toEqual({
+    const queued = {
       kind: "queued",
       waitMs: 30000,
+      retryAfterMs: 30000,
       queueCount: 0,
       queueType: "p4",
-    });
-    expect(parseModelBusyRejection(busyBody({ isQueued: true, waitTime: "367", retryAfterSeconds: 30 }))).toEqual({
-      kind: "queued",
-      waitMs: 30000,
-      queueCount: 0,
-      queueType: "p4",
-    });
+      modelKey: "ultimate",
+    };
+    expect(parseModelBusyRejection(busyBody({ isQueued: true, retryAfterSeconds: 30 }))).toEqual(queued);
+    expect(parseModelBusyRejection(busyBody({ isQueued: true, waitTime: "367", retryAfterSeconds: 30 }))).toEqual(
+      queued,
+    );
   });
 
   it.each([1e300, Number.MAX_VALUE, Number.MAX_SAFE_INTEGER])(
     "uses retryAfterSeconds when queue waitTime=%s exceeds safe milliseconds",
     (waitTime) => {
-      expect(parseModelBusyRejection(busyBody({ isQueued: true, waitTime, retryAfterSeconds: 30 }))).toEqual({
+      expect(parseModelBusyRejection(busyBody({ isQueued: true, waitTime, retryAfterSeconds: 30 }))).toMatchObject({
         kind: "queued",
         waitMs: 30000,
-        queueCount: 0,
-        queueType: "p4",
       });
     },
   );
@@ -235,6 +313,35 @@ describe("parseModelBusyRejection", () => {
   it("survives a non-JSON body", () => {
     expect(parseModelBusyRejection("blocked")).toBeUndefined();
     expect(parseModelBusyRejection(undefined)).toBeUndefined();
+  });
+});
+
+describe("parseModelQueueStatus", () => {
+  it("reads the flat live status body", () => {
+    expect(
+      parseModelQueueStatus(queueStatus({ isQueued: true, serviceAvailable: false, retryAfterSeconds: 30 })),
+    ).toEqual({
+      isQueued: true,
+      serviceAvailable: false,
+      snapshot: {
+        kind: "queued",
+        waitMs: 30000,
+        retryAfterMs: 30000,
+        queueCount: 0,
+        queueType: "p3",
+        modelKey: "ultimate",
+      },
+    });
+  });
+
+  it("finds the status nested under data as a JSON string", () => {
+    const nested = JSON.stringify({ success: true, data: queueStatus({ isQueued: false, serviceAvailable: true }) });
+    expect(parseModelQueueStatus(nested)).toMatchObject({ isQueued: false, serviceAvailable: true });
+  });
+
+  it("rejects a body without queue flags", () => {
+    expect(parseModelQueueStatus(JSON.stringify({ success: false, message: "Internal Server Error" }))).toBeUndefined();
+    expect(parseModelQueueStatus("<html>")).toBeUndefined();
   });
 });
 
@@ -361,22 +468,110 @@ describe("streamQoder model-busy recovery", () => {
     expect(errorOf(events).errorMessage).toMatch(/attempts=3/);
   });
 
-  it("surfaces a real queue as a host-schedulable error instead of a bare 403", async () => {
-    globalThis.fetch = mockFetchSequence([
-      busySse({ isQueued: true, waitTime: 367, retryAfterSeconds: 30, queueCount: 454, queueType: "p2" }),
-      SUCCESS_SSE,
+  it("waits in the model queue for the live serviceAvailable:false shape, then re-sends and releases", async () => {
+    globalThis.fetch = mockQueueRoutes({
+      chat: [LIVE_QUEUED_SSE, SUCCESS_SSE],
+      status: [
+        queueStatus({ isQueued: true, serviceAvailable: false, retryAfterSeconds: 0.5 }),
+        queueStatus({ isQueued: false, serviceAvailable: true, retryAfterSeconds: 0 }),
+      ],
+    });
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(doneOf(events).content.find((c) => c.type === "text")).toMatchObject({ text: "pong" });
+    expect(events.filter((e) => e.type === "start")).toHaveLength(1);
+    await vi.waitFor(() => expect(callsOf("finish")).toHaveLength(1));
+    expect(vi.mocked(globalThis.fetch).mock.calls.map(([input]) => routeOf(String(input)))).toEqual([
+      "chat",
+      "status",
+      "status",
+      "chat",
+      "finish",
     ]);
+
+    const [firstChat, retriedChat] = callsOf("chat").map(([, init]) => decodeRequestBody(init));
+    expect(retriedChat.request_set_id).toBe(firstChat.request_set_id);
+    expect(retriedChat.request_id).not.toBe(firstChat.request_id);
+    expect(retriedChat.chat_record_id).toBe(retriedChat.request_id);
+
+    const [statusURL, statusInit] = callsOf("status")[0];
+    const status = new URL(statusURL);
+    expect(status.pathname).toBe("/algo/api/v2/service/ask/queue/status");
+    expect(status.searchParams.get("requestSetId")).toBe(firstChat.request_set_id);
+    expect(status.searchParams.get("modelKey")).toBe("ultimate");
+    expect(status.searchParams.get("queueType")).toBe("p3");
+    // The gateway verifies the signature against the path without `/algo`.
+    expect(new Headers(statusInit?.headers).get("Cosy-Sigpath")).toBe("/api/v2/service/ask/queue/status");
+
+    const [finishURL, finishInit] = callsOf("finish")[0];
+    expect(new URL(finishURL).pathname).toBe("/algo/api/v2/service/ask/finish");
+    const finish = decodeRequestBody(finishInit);
+    expect(finish.encodeVersion).toBe("1");
+    expect(JSON.parse(String(finish.payload))).toMatchObject({
+      model_key: "ultimate",
+      request_set_id: firstChat.request_set_id,
+      user_id: "test-user",
+      time_consumed: expect.any(Number),
+    });
+  });
+
+  it("falls back to a host-schedulable error when the queue status endpoint is missing", async () => {
+    globalThis.fetch = mockQueueRoutes({ chat: [LIVE_QUEUED_SSE, SUCCESS_SSE], status: [{ body: "", status: 404 }] });
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
     const message = errorOf(events);
 
-    // Not retried in-line: the wait belongs to the host's retry policy.
-    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(1);
+    expect(callsOf("chat")).toHaveLength(1);
     expect(message.errorMessage).toMatch(/request queued/);
-    expect(message.errorMessage).toMatch(/454 ahead/);
-    expect(message.errorMessage).toMatch(/p2/);
-    expect(message.errorMessage).toMatch(/retry-after-ms=367000/);
+    expect(message.errorMessage).toMatch(/\(p3\)/);
+    expect(message.errorMessage).toMatch(/queue status endpoint unavailable/);
+    expect(message.errorMessage).toMatch(/retry-after-ms=30000/);
     expect(message.errorMessage).not.toMatch(/403/);
     expect(isRetryableAssistantError(message)).toBe(true);
+    await vi.waitFor(() => expect(callsOf("finish")).toHaveLength(1));
+  });
+
+  it("gives up with a host-schedulable error once the queue wait budget is spent", async () => {
+    vi.stubEnv("QODER_MODEL_QUEUE_MAX_WAIT_MS", "1");
+    try {
+      globalThis.fetch = mockQueueRoutes({
+        chat: [LIVE_QUEUED_SSE],
+        status: [queueStatus({ isQueued: true, serviceAvailable: false, retryAfterSeconds: 30 })],
+      });
+      const message = errorOf(await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" })));
+
+      expect(callsOf("chat")).toHaveLength(1);
+      expect(message.errorMessage).toMatch(/queue wait budget exhausted/);
+      expect(isRetryableAssistantError(message)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("stops waiting as soon as the caller aborts, and still releases the slot", async () => {
+    const controller = new AbortController();
+    globalThis.fetch = mockQueueRoutes({
+      chat: [LIVE_QUEUED_SSE, SUCCESS_SSE],
+      status: [queueStatus({ isQueued: true, serviceAvailable: false, retryAfterSeconds: 30 })],
+      onStatus: () => queueMicrotask(() => controller.abort()),
+    });
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }),
+    );
+
+    expect(errorOf(events).stopReason).toBe("aborted");
+    expect(callsOf("chat")).toHaveLength(1);
+    await vi.waitFor(() => expect(callsOf("finish")).toHaveLength(1));
+  });
+
+  it("does not re-send a queued rejection that arrives after partial output", async () => {
+    const sse = envelope(JSON.stringify(chunk({ content: "partial", role: "assistant" }))) + LIVE_QUEUED_SSE;
+    globalThis.fetch = mockQueueRoutes({ chat: [sse, SUCCESS_SSE], status: [queueStatus({ isQueued: false })] });
+    const message = errorOf(await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" })));
+
+    expect(callsOf("chat")).toHaveLength(1);
+    expect(callsOf("status")).toHaveLength(0);
+    expect(message.errorMessage).toMatch(/after partial output/);
+    expect(isRetryableAssistantError(message)).toBe(false);
   });
 
   it("keeps the previous behavior when only subCode matches", async () => {

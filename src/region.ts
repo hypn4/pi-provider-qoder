@@ -97,6 +97,24 @@ export function getQoderChatURL(mode: QoderMode): string {
   return `${getQoderChatBaseUrl(mode)}algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
 }
 
+/**
+ * Qoder's model queue lives on the same node as chat. Paths and the
+ * `Encode=1` finish body match the official qodercli worker; the gateway
+ * returns 404 without the `/algo` prefix.
+ */
+export function getQoderModelQueueStatusURL(
+  mode: QoderMode,
+  query: { requestSetId: string; modelKey: string; queueType?: string },
+): string {
+  const params = new URLSearchParams({ requestSetId: query.requestSetId, modelKey: query.modelKey });
+  if (query.queueType) params.set("queueType", query.queueType);
+  return `${getQoderChatBaseUrl(mode)}algo/api/v2/service/ask/queue/status?${params}`;
+}
+
+export function getQoderModelQueueFinishURL(mode: QoderMode): string {
+  return `${getQoderChatBaseUrl(mode)}algo/api/v2/service/ask/finish?Encode=1`;
+}
+
 export function getQoderExchangeURL(mode: QoderMode): string {
   return `${getQoderRegionConfig(mode).openApiUrl}/api/v1/jobToken/exchange`;
 }

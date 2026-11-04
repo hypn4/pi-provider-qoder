@@ -17,31 +17,55 @@ import {
 } from "@earendil-works/pi-ai";
 import { resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
-import { buildAuthHeaders, getMachineId } from "../cosy.js";
+import { buildAuthHeaders, type CosyCredentials, getMachineId } from "../cosy.js";
 import { applyQoderCredits } from "../credits.js";
 import { rememberChatBaseUrl, rotateChatEndpoint } from "../endpoints.js";
-import { getQoderChatBaseUrl, getQoderChatURL, getQoderRegionConfig } from "../region.js";
+import {
+  getQoderChatBaseUrl,
+  getQoderChatURL,
+  getQoderModelQueueFinishURL,
+  getQoderModelQueueStatusURL,
+  getQoderRegionConfig,
+  type QoderMode,
+} from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
 /**
  * Qoder's scheduler reports a busy model as error code 10605. The official
- * client treats `isQueued:false` + `serviceAvailable:true` as "ready" and
- * re-sends the request after `retryAfterSeconds`; without that recovery one
- * transient rejection kills the whole turn. We mirror the bounded part of it.
+ * client (qodercli worker) handles two shapes:
  *
- * A real queue (`isQueued:true`) is NOT retried in-line: the wait can be
- * minutes, and sleeping inside the stream would block the turn under the
- * host's abort and retry policy. Instead the queued rejection is surfaced
- * as a host-schedulable error carrying the queue fields and a
- * `retry-after-ms=` hint, with no bare `403` in the text (a bare 403 is
- * classified as an auth failure by the host and never retried).
+ * - Ready (`isQueued:false` + `serviceAvailable:true`): re-send after
+ *   `retryAfterSeconds`. Mirrored in-line with a small, bounded budget.
+ * - Queued (`isQueued:true`, or `serviceAvailable:false`): the request was
+ *   admitted to the account's model queue. The client polls
+ *   `ask/queue/status` with the same request_set_id until the status reports
+ *   `isQueued:false`, re-sends the request, and releases the slot with
+ *   `ask/finish` once the request ends. Mirrored in-line too, bounded by
+ *   QODER_MODEL_QUEUE_MAX_WAIT_MS (the official client's variable, default
+ *   1h) and the caller's abort signal.
+ *
+ * When the queue cannot be waited on (status endpoint missing, repeated poll
+ * failures, wait budget exhausted) the rejection is surfaced as a
+ * host-schedulable error carrying the queue fields and a `retry-after-ms=`
+ * hint, with no bare `403` in the text (a bare 403 is classified as an auth
+ * failure by the host and never retried).
  */
 const MODEL_BUSY_CODE = "10605";
 const DEFAULT_MODEL_BUSY_RETRIES = 2;
 const MAX_MODEL_BUSY_RETRIES = 10;
 const MODEL_BUSY_MAX_WAIT_MS = 5_000;
+
+// Model-queue limits, copied from the official client.
+const MODEL_QUEUE_DEFAULT_MAX_WAIT_MS = 60 * 60_000;
+const MODEL_QUEUE_MIN_POLL_MS = 500;
+const MODEL_QUEUE_MAX_POLL_MS = 30_000;
+const MODEL_QUEUE_DEFAULT_POLL_MS = 30_000;
+const MODEL_QUEUE_MAX_POLL_FAILURES = 3;
+const MODEL_QUEUE_MAX_RECOVERIES = 10;
+const MODEL_QUEUE_REQUEST_TIMEOUT_MS = 30_000;
+const MODEL_QUEUE_FINISH_TIMEOUT_MS = 3_000;
 
 /**
  * Qoder tracks the daily chat allowance per node, so an account can exhaust it
@@ -76,14 +100,29 @@ class QoderModelBusyError extends Error {
   }
 }
 
-type ModelBusyQueueSnapshot =
-  | { kind: "ready"; retryAfterMs?: number }
-  | {
-      kind: "queued";
-      waitMs: number;
-      queueCount?: number;
-      queueType?: string;
-    };
+type QueuedSnapshot = {
+  kind: "queued";
+  /** Host retry hint: `waitTime`, else `retryAfterSeconds`. */
+  waitMs: number;
+  /** `retryAfterSeconds`: the queue poll interval (0 when absent/invalid). */
+  retryAfterMs: number;
+  queueCount?: number;
+  queueType?: string;
+  modelKey?: string;
+};
+
+type ModelBusyQueueSnapshot = { kind: "ready"; retryAfterMs?: number } | QueuedSnapshot;
+
+/** A request that was admitted to Qoder's model queue (10605, queued shape). */
+class QoderModelQueuedError extends Error {
+  constructor(
+    readonly snapshot: QueuedSnapshot,
+    readonly sawModelOutput: boolean,
+  ) {
+    super(formatQueuedBusyError(snapshot).message);
+    this.name = "QoderModelQueuedError";
+  }
+}
 
 /** Parse `unknown | JSON string` layers until an object is found (bounded). */
 function parseJsonObject(value: unknown, depth = 0): Record<string, unknown> | undefined {
@@ -98,6 +137,26 @@ function parseJsonObject(value: unknown, depth = 0): Record<string, unknown> | u
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+/** Positive finite seconds → safe integer milliseconds; anything else → 0. */
+function secondsToMs(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+  const milliseconds = Math.round(value * 1000);
+  return Number.isSafeInteger(milliseconds) && milliseconds > 0 ? milliseconds : 0;
+}
+
+/** Read the queue fields shared by the 10605 body and `ask/queue/status`. */
+function queuedSnapshot(queue: Record<string, unknown>): QueuedSnapshot {
+  const retryAfterMs = secondsToMs(queue.retryAfterSeconds);
+  return {
+    kind: "queued",
+    waitMs: secondsToMs(queue.waitTime) || retryAfterMs,
+    retryAfterMs,
+    queueCount: typeof queue.queueCount === "number" ? queue.queueCount : undefined,
+    queueType: typeof queue.queueType === "string" && queue.queueType ? queue.queueType : undefined,
+    modelKey: typeof queue.modelKey === "string" && queue.modelKey ? queue.modelKey : undefined,
+  };
 }
 
 /**
@@ -118,17 +177,16 @@ export function isDailyChatLimitRejection(body: unknown): boolean {
  * Envelope body shape (three nested JSON layers):
  *   {code:"403",message:"{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":false,...}\",\"subCode\":\"RESOURCE_LIMIT\"}"}
  *
- * Only the documented 10605 code with `serviceAvailable:true` is eligible.
- * `subCode` is diagnostic only — it is not a retry signal.
+ * Only the documented 10605 code with both `isQueued` and
+ * `serviceAvailable` flags is eligible. `subCode` is diagnostic only — it is
+ * not a retry signal.
  *
- * - `isQueued:false` ("ready"): the caller may re-send after
+ * - `isQueued:false` + `serviceAvailable:true` ("ready"): re-send after
  *   `retryAfterSeconds`; the stream loop retries this in-line, bounded.
- * - `isQueued:true` ("queued"): the request sits in a real queue. The
- *   snapshot carries the wait hint, preferring `waitTime` (seconds until
- *   this request's slot) over `retryAfterSeconds` (a minimum re-ask
- *   interval); re-asking at the shorter interval would land at the back
- *   of the queue. The stream loop does NOT sleep on this — it surfaces
- *   a host-schedulable error instead.
+ * - `isQueued:true`, or `serviceAvailable:false` ("queued"): the request
+ *   sits in the model queue. `waitMs` prefers `waitTime` (seconds until
+ *   this request's slot) over `retryAfterSeconds` (the poll interval) and is
+ *   the hint for the host when the queue cannot be waited on in-line.
  * - Missing flags or any other code: not a busy signal, keep the
  *   previous failure behavior.
  */
@@ -137,21 +195,41 @@ export function parseModelBusyRejection(body: unknown): ModelBusyQueueSnapshot |
   const busy = parseJsonObject(outer?.message);
   if (busy?.code !== MODEL_BUSY_CODE) return undefined;
   const queue = parseJsonObject(busy.message);
-  if (!queue) return undefined;
-  if (queue.serviceAvailable !== true) return undefined;
-  const seconds = (value: unknown): number => {
-    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
-    const milliseconds = Math.round(value * 1000);
-    return Number.isSafeInteger(milliseconds) && milliseconds > 0 ? milliseconds : 0;
-  };
-  if (queue.isQueued === false) {
-    return { kind: "ready", retryAfterMs: seconds(queue.retryAfterSeconds) };
+  if (!queue || typeof queue.isQueued !== "boolean" || typeof queue.serviceAvailable !== "boolean") {
+    return undefined;
   }
-  if (queue.isQueued === true) {
-    const waitMs = seconds(queue.waitTime) || seconds(queue.retryAfterSeconds);
-    const queueCount = typeof queue.queueCount === "number" ? queue.queueCount : undefined;
-    const queueType = typeof queue.queueType === "string" ? queue.queueType : undefined;
-    return { kind: "queued", waitMs, queueCount, queueType };
+  if (!queue.isQueued && queue.serviceAvailable) {
+    return { kind: "ready", retryAfterMs: secondsToMs(queue.retryAfterSeconds) };
+  }
+  return queuedSnapshot(queue);
+}
+
+/** A poll result from `ask/queue/status`. */
+export interface ModelQueueStatus {
+  isQueued?: boolean;
+  serviceAvailable?: boolean;
+  snapshot: QueuedSnapshot;
+}
+
+/**
+ * Parse an `ask/queue/status` response. The live gateway answers with a flat
+ * object (`{"isQueued":true,"serviceAvailable":false,"queueType":"p3",...}`);
+ * like the official client, also accept it nested under
+ * `data`/`result`/`message`/`body`, as objects or JSON strings.
+ */
+export function parseModelQueueStatus(body: unknown): ModelQueueStatus | undefined {
+  const pending: unknown[] = [body];
+  const seen = new Set<Record<string, unknown>>();
+  while (pending.length > 0 && seen.size < 16) {
+    const node = parseJsonObject(pending.shift());
+    if (!node || seen.has(node)) continue;
+    seen.add(node);
+    const isQueued = typeof node.isQueued === "boolean" ? node.isQueued : undefined;
+    const serviceAvailable = typeof node.serviceAvailable === "boolean" ? node.serviceAvailable : undefined;
+    if (isQueued !== undefined || serviceAvailable !== undefined) {
+      return { isQueued, serviceAvailable, snapshot: queuedSnapshot(node) };
+    }
+    pending.push(node.data, node.result, node.message, node.body);
   }
   return undefined;
 }
@@ -163,15 +241,170 @@ export function parseModelBusyRejection(body: unknown): ModelBusyQueueSnapshot |
  * can schedule on, and stays retryable under pi-ai's retryable pattern
  * via the truthful "rate limit" token (the queue is a CALL_COUNT_LIMIT
  * throttle). Queue fields are included so a queued failure is
- * distinguishable from an auth failure in logs and transcripts.
+ * distinguishable from an auth failure in logs and transcripts. `reason`
+ * says why the in-line queue wait gave up.
  */
-export function formatQueuedBusyError(snapshot: Extract<ModelBusyQueueSnapshot, { kind: "queued" }>): Error {
+export function formatQueuedBusyError(snapshot: QueuedSnapshot, reason?: string): Error {
   const waitSeconds = Math.round(snapshot.waitMs / 1000);
   const ahead = snapshot.queueCount !== undefined ? `, ${snapshot.queueCount} ahead` : "";
   const tier = snapshot.queueType ? ` (${snapshot.queueType})` : "";
+  const why = reason ? `, ${reason}` : "";
   return new Error(
-    `Qoder model is busy: request queued (10605 CALL_COUNT_LIMIT${tier}${ahead}, ~${waitSeconds}s wait, rate limit, retry-after-ms=${snapshot.waitMs})`,
+    `Qoder model is busy: request queued (10605 CALL_COUNT_LIMIT${tier}${ahead}, ~${waitSeconds}s wait${why}, rate limit, retry-after-ms=${snapshot.waitMs})`,
   );
+}
+
+function debugQueue(message: string): void {
+  if (process.env.QODER_DEBUG) console.error(`[pi-provider-qoder] model queue: ${message}`);
+}
+
+/** `QODER_MODEL_QUEUE_MAX_WAIT_MS` (positive ms), else the official 1h default. */
+function modelQueueMaxWaitMs(): number {
+  const value = Number(process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS);
+  return Number.isFinite(value) && value > 0 ? value : MODEL_QUEUE_DEFAULT_MAX_WAIT_MS;
+}
+
+/** The official client's poll interval: retryAfterSeconds clamped to 0.5–30s, 30s when absent. */
+function modelQueuePollMs(retryAfterMs: number): number {
+  if (retryAfterMs <= 0) return MODEL_QUEUE_DEFAULT_POLL_MS;
+  return Math.min(MODEL_QUEUE_MAX_POLL_MS, Math.max(MODEL_QUEUE_MIN_POLL_MS, retryAfterMs));
+}
+
+interface ModelQueueRequest {
+  mode: QoderMode;
+  creds: CosyCredentials;
+  requestSetId: string;
+  sessionId: string;
+  modelKey: string;
+  signal?: AbortSignal;
+}
+
+/** The status endpoint does not exist on this node; polling cannot help. */
+class ModelQueueUnavailableError extends Error {}
+
+async function fetchModelQueueStatus(
+  request: ModelQueueRequest,
+  snapshot: QueuedSnapshot,
+  deadline: number,
+): Promise<ModelQueueStatus> {
+  const url = getQoderModelQueueStatusURL(request.mode, {
+    requestSetId: request.requestSetId,
+    modelKey: snapshot.modelKey ?? request.modelKey,
+    queueType: snapshot.queueType,
+  });
+  const timeout = AbortSignal.timeout(Math.max(1, Math.min(MODEL_QUEUE_REQUEST_TIMEOUT_MS, deadline - Date.now())));
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      "X-Session-ID": request.sessionId,
+      ...buildAuthHeaders(null, url, request.creds),
+    },
+    signal: request.signal ? AbortSignal.any([request.signal, timeout]) : timeout,
+  });
+  const text = await response.text();
+  if (response.status === 404) throw new ModelQueueUnavailableError("queue status endpoint unavailable");
+  if (!response.ok) throw new Error(`queue status HTTP ${response.status}`);
+  const status = parseModelQueueStatus(text);
+  if (!status) throw new Error("queue status response is invalid");
+  return status;
+}
+
+/**
+ * Wait in Qoder's model queue the way the official client does: poll
+ * `ask/queue/status` (first poll immediately, then every retryAfterSeconds),
+ * keep waiting while the request is queued or the service is unavailable,
+ * and return the re-send delay once the status reports `isQueued:false`.
+ *
+ * Gives up with a host-schedulable error (never a bare 403) when the
+ * endpoint is missing, three consecutive polls fail, the status is not
+ * recoverable, or the deadline passes. Caller aborts propagate as-is.
+ */
+async function waitForModelQueue(
+  request: ModelQueueRequest,
+  initial: QueuedSnapshot,
+  deadline: number,
+): Promise<number> {
+  let snapshot = initial;
+  let polled = false;
+  let failures = 0;
+  for (;;) {
+    if (polled) {
+      await sleepWithAbort(Math.min(modelQueuePollMs(snapshot.retryAfterMs), deadline - Date.now()), request.signal);
+    }
+    if (Date.now() >= deadline) throw formatQueuedBusyError(snapshot, "queue wait budget exhausted");
+    polled = true;
+    let status: ModelQueueStatus;
+    try {
+      status = await fetchModelQueueStatus(request, snapshot, deadline);
+    } catch (e) {
+      if (request.signal?.aborted) throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      if (e instanceof ModelQueueUnavailableError) throw formatQueuedBusyError(snapshot, message);
+      failures++;
+      debugQueue(`status poll failed (${failures}/${MODEL_QUEUE_MAX_POLL_FAILURES}): ${message}`);
+      if (failures >= MODEL_QUEUE_MAX_POLL_FAILURES) {
+        throw formatQueuedBusyError(snapshot, "queue status polling failed");
+      }
+      // Like the official client, fall back to the default interval.
+      snapshot = { ...snapshot, retryAfterMs: 0 };
+      continue;
+    }
+    failures = 0;
+    snapshot = {
+      ...status.snapshot,
+      modelKey: status.snapshot.modelKey ?? snapshot.modelKey,
+      queueType: status.snapshot.queueType ?? snapshot.queueType,
+    };
+    debugQueue(
+      `status isQueued=${status.isQueued} serviceAvailable=${status.serviceAvailable} queueType=${snapshot.queueType ?? ""} queueCount=${snapshot.queueCount ?? ""} retryAfterMs=${snapshot.retryAfterMs}`,
+    );
+    if (status.isQueued === false) {
+      return Math.min(snapshot.retryAfterMs > 0 ? modelQueuePollMs(snapshot.retryAfterMs) : 0, deadline - Date.now());
+    }
+    if (status.serviceAvailable === false || status.isQueued === true) continue;
+    throw formatQueuedBusyError(snapshot, "queue status is not recoverable");
+  }
+}
+
+/**
+ * Release the request set's queue slot (`ask/finish`). Best effort: the
+ * server's lease TTL releases it anyway, so failures are only logged.
+ */
+async function releaseModelQueue(
+  request: Omit<ModelQueueRequest, "signal" | "sessionId">,
+  timeConsumedMs: number,
+): Promise<void> {
+  const url = getQoderModelQueueFinishURL(request.mode);
+  const body = qoderEncodeBody(
+    Buffer.from(
+      JSON.stringify({
+        payload: JSON.stringify({
+          model_key: request.modelKey,
+          request_set_id: request.requestSetId,
+          user_id: request.creds.userID,
+          time_consumed: Math.max(0, Math.round(timeConsumedMs)),
+        }),
+        encodeVersion: "1",
+      }),
+    ),
+  );
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...buildAuthHeaders(body, url, request.creds),
+      },
+      body: body as unknown as BodyInit,
+      signal: AbortSignal.timeout(MODEL_QUEUE_FINISH_TIMEOUT_MS),
+    });
+    await response.text();
+    debugQueue(`finish HTTP ${response.status}`);
+  } catch (e) {
+    debugQueue(`finish failed; the server lease TTL releases the slot: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 /** Sleep that rejects as soon as the caller aborts. */
@@ -506,6 +739,8 @@ export function streamQoder(
   };
 
   (async () => {
+    const startedAt = Date.now();
+    let releaseQueue: (() => Promise<void>) | undefined;
     try {
       const providerMode = model.provider === "qoder-cn" ? "cn" : "global";
       const region = getQoderRegionConfig(providerMode);
@@ -859,13 +1094,10 @@ export function streamQoder(
                     );
                   }
                   if (busy?.kind === "queued") {
-                    // A queued rejection that arrives after partial output
-                    // must not be host-retried: re-running the turn would
-                    // duplicate the content already emitted.
-                    if (sawModelOutput) {
-                      throw new Error("Qoder model rejected the request after partial output (10605 RESOURCE_LIMIT)");
-                    }
-                    throw formatQueuedBusyError(busy);
+                    // The attempt loop waits in the queue; it refuses to
+                    // re-send after partial output so content is never
+                    // duplicated.
+                    throw new QoderModelQueuedError(busy, sawModelOutput);
                   }
                   if (isDailyChatLimitRejection(envelope.body)) {
                     // Another chat node may still serve this account; the
@@ -1221,7 +1453,22 @@ export function streamQoder(
         stream.end();
       };
 
-      for (let attempt = 0; ; attempt++) {
+      const creds: CosyCredentials = { userID, authToken: accessToken, name, email, machineID };
+      // qodercli resets request_id and chat_record_id to ONE new value per
+      // recovery attempt and keeps request_set_id, so the server can
+      // correlate the retry with the same request set (and its queue slot).
+      const resendWithNewRecordId = () => {
+        const nextId = crypto.randomUUID();
+        reqBody.request_id = nextId;
+        reqBody.chat_record_id = nextId;
+        encodedBytes = qoderEncodeBody(Buffer.from(JSON.stringify(reqBody)));
+        headers = buildAuthHeaders(encodedBytes, chatURL, creds);
+      };
+
+      let busyRetries = 0;
+      let queueRecoveries = 0;
+      let queueDeadline: number | undefined;
+      for (;;) {
         try {
           await runAttempt();
           if (switchedChatEndpoint) {
@@ -1233,26 +1480,47 @@ export function streamQoder(
         } catch (e) {
           if (e instanceof QoderDailyChatLimitError) {
             if (!e.sawModelOutput && chatEndpointSwitches < MAX_CHAT_ENDPOINT_SWITCHES) {
-              const nextBase = await rotateChatEndpoint(
-                providerMode,
-                { userID, authToken: accessToken, name, email, machineID },
-                attemptedChatBases,
-              );
+              const nextBase = await rotateChatEndpoint(providerMode, creds, attemptedChatBases);
               if (nextBase) {
                 chatEndpointSwitches++;
                 switchedChatEndpoint = true;
                 chatURL = getQoderChatURL(providerMode);
-                headers = buildAuthHeaders(encodedBytes, chatURL, {
-                  userID,
-                  authToken: accessToken,
-                  name,
-                  email,
-                  machineID,
-                });
+                headers = buildAuthHeaders(encodedBytes, chatURL, creds);
                 continue;
               }
             }
             throw e;
+          }
+          if (e instanceof QoderModelQueuedError) {
+            if (e.sawModelOutput || output.content.length > 0) {
+              // Keep this wording out of pi-ai's retryable pattern: retrying a
+              // turn that already emitted content would duplicate it.
+              throw new Error("Qoder model rejected the request after partial output (10605 RESOURCE_LIMIT)");
+            }
+            if (queueRecoveries >= MODEL_QUEUE_MAX_RECOVERIES) {
+              throw formatQueuedBusyError(e.snapshot, "queue recovery attempts exceeded");
+            }
+            queueRecoveries++;
+            const queueRequest: ModelQueueRequest = {
+              mode: providerMode,
+              creds,
+              requestSetId: recordID,
+              sessionId: sessionID,
+              modelKey: e.snapshot.modelKey ?? qoderModel,
+              signal: options?.signal,
+            };
+            // Entering the queue takes a slot for this request set; release it
+            // however the request ends.
+            releaseQueue ??= () => releaseModelQueue(queueRequest, Date.now() - startedAt);
+            queueDeadline ??= Date.now() + modelQueueMaxWaitMs();
+            debugQueue(
+              `entered (model=${queueRequest.modelKey} queueType=${e.snapshot.queueType ?? ""} recovery=${queueRecoveries})`,
+            );
+            const resendDelayMs = await waitForModelQueue(queueRequest, e.snapshot, queueDeadline);
+            await sleepWithAbort(resendDelayMs, options?.signal);
+            options?.signal?.throwIfAborted();
+            resendWithNewRecordId();
+            continue;
           }
           if (!(e instanceof QoderModelBusyError)) throw e;
           if (e.sawModelOutput || output.content.length > 0) {
@@ -1261,9 +1529,9 @@ export function streamQoder(
             throw new Error("Qoder model rejected the request after partial output (10605 RESOURCE_LIMIT)");
           }
           const requestedWaitMs = e.retryAfterMs ?? 0;
-          if (attempt >= modelBusyRetries) {
+          if (busyRetries >= modelBusyRetries) {
             throw new QoderModelBusyError(
-              `Qoder server error: model is busy (10605 RESOURCE_LIMIT, retryAfterSeconds=${Math.round(requestedWaitMs / 1000)}, attempts=${attempt + 1})`,
+              `Qoder server error: model is busy (10605 RESOURCE_LIMIT, retryAfterSeconds=${Math.round(requestedWaitMs / 1000)}, attempts=${busyRetries + 1})`,
               requestedWaitMs,
             );
           }
@@ -1273,23 +1541,11 @@ export function streamQoder(
               requestedWaitMs,
             );
           }
+          busyRetries++;
           await sleepWithAbort(requestedWaitMs, options?.signal);
           // Covers an abort that lands between the wait and the next attempt.
           options?.signal?.throwIfAborted();
-          // qodercli resets request_id and chat_record_id to ONE new value per
-          // recovery attempt and keeps request_set_id, so the server can
-          // correlate the retry with the same request set.
-          const nextId = crypto.randomUUID();
-          reqBody.request_id = nextId;
-          reqBody.chat_record_id = nextId;
-          encodedBytes = qoderEncodeBody(Buffer.from(JSON.stringify(reqBody)));
-          headers = buildAuthHeaders(encodedBytes, chatURL, {
-            userID,
-            authToken: accessToken,
-            name,
-            email,
-            machineID,
-          });
+          resendWithNewRecordId();
         }
       }
     } catch (e: unknown) {
@@ -1299,6 +1555,8 @@ export function streamQoder(
       try {
         stream.end();
       } catch {}
+    } finally {
+      if (releaseQueue) await releaseQueue();
     }
   })();
 
